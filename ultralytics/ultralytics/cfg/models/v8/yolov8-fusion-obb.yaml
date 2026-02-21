@@ -1,0 +1,49 @@
+# YOLOv8-Fusion-OBB
+# 针对 RGB-IR 融合的旋转检测模型
+
+# 参数
+nc: 4  # 你的类别数 (car, truck, bus, person)
+scales: # model compound scaling constants, i.e. 'n', 's', 'm', 'l', 'x'
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+backbone:
+  # [from, repeats, module, args]
+
+  # === 核心修改：第一层使用 UAMFusion ===
+  # 输入 4 通道 -> 输出 64 通道, 卷积核 3, 步长 2
+  - [-1, 1, Fusion, [64, 3, 2]]  # 0-P1/2
+
+  # === 下面是标准 YOLOv8 Backbone ===
+  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4
+  - [-1, 3, C2f, [128, True]]
+  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8
+  - [-1, 6, C2f, [256, True]]
+  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 6, C2f, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 3, C2f, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]]  # 9
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 6], 1, Concat, [1]]  # cat backbone P4
+  - [-1, 3, C2f, [512]]  # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 4], 1, Concat, [1]]  # cat backbone P3
+  - [-1, 3, C2f, [256]]  # 15 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]  # cat head P4
+  - [-1, 3, C2f, [512]]  # 18 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 9], 1, Concat, [1]]  # cat head P5
+  - [-1, 3, C2f, [1024]]  # 21 (P5/32-large)
+
+  # === 头部：使用 OBB 检测头 ===
+  - [[15, 18, 21], 1, OBB, [nc, 1]]  # OBB(P3, P4, P5)

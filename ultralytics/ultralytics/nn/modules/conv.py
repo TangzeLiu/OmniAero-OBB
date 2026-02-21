@@ -24,6 +24,7 @@ __all__ = (
     "LightConv",
     "RepConv",
     "SpatialAttention",
+    "Fusion"
 )
 
 
@@ -671,7 +672,7 @@ class Index(nn.Module):
 
 # Zhang written
 class Fusion(nn.Module):
-    def __init__(self,c1,c2,k,s,p,g,d,act):
+    def __init__(self,c1,c2,k=3,s=2,p=None,g=1,d=1,act=True):
         """Initialize Fusion module.
         Args:
             c1 输入通道数
@@ -684,12 +685,52 @@ class Fusion(nn.Module):
             act
             """
         super().__init__()
-        from .conv import autopad
+        # from .conv import autopad
         pad = autopad(k,p,d)    # autopad 会返回一个值或一个列表，代表补几圈0
 
         self.conv_rgb =  nn.Conv2d(3,c2,k,s,pad,groups=g,dilation=d,bias=False)
-        self.conv_ir  =  nn.Conv2d(c2,c1,k,s,pad,groups=g,dilation=d,bias=False)
+        self.conv_ir  =  nn.Conv2d(1,c2,k,s,pad,groups=g,dilation=d,bias=False)
 
-        hiiden_dim =  max(8,c2 // 2)
+        hidden_dim = max(8, c2 // 2)
 
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # 第一步：全局平均池化 (压缩空间维度)
+            nn.Conv2d(c2 * 2, hidden_dim, 1),  # 第二步：降维挤压 (Squeeze)
+            nn.ReLU(inplace=True),  # 第三步：非线性激活 (赋予逻辑思考能力)
+            nn.Conv2d(hidden_dim, 2, 1),  # 第四步：升维输出 (Excite -> 输出 2 个权重)
+            nn.Softmax(dim=1)  # 第五步：互补归一化 (W_rgb + W_ir = 1)
+        )
 
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+    def forward(self, x):
+        """
+        前向传播逻辑
+        x: [Batch, 4, Height, Width]
+        """
+        # --- 步骤 A: 模态物理解耦 (Modality Split) ---
+        x_rgb = x[:, :3, :, :]  # 提取前 3 个通道 (RGB)
+        x_ir = x[:, 3:4, :, :]  # 提取最后 1 个通道 (IR)
+
+        # --- 步骤 B: 独立空间特征提取 (Spatial Feature Extraction) ---
+        feat_rgb = self.conv_rgb(x_rgb)  # 得到 RGB 高级特征 [B, c2, H, W]
+        feat_ir = self.conv_ir(x_ir)  # 得到 IR 高级特征 [B, c2, H, W]
+
+        # --- 步骤 C: 跨模态不确定性推理 (Cross-Modal Uncertainty Inference) ---
+        # 拼接特征，让网络同时“看”到两个模态的好坏
+        cat_feat = torch.cat([feat_rgb, feat_ir], dim=1)  # [B, 2*c2, H, W]
+
+        # 计算动态权重 [B, 2, 1, 1]
+        weights = self.attention(cat_feat)
+
+        # 拆分权重 (此时 w_rgb 和 w_ir 是两个加起来等于 1 的动态浮点数)
+        w_rgb = weights[:, 0:1, :, :]
+        w_ir = weights[:, 1:2, :, :]
+
+        # --- 步骤 D: 互补加权融合 (Complementary Weighted Fusion) ---
+        # 广播机制将权重应用到整张特征图的每一个像素上
+        feat_fused = (feat_rgb * w_rgb) + (feat_ir * w_ir)
+
+        # --- 步骤 E: 输出 ---
+        return self.act(self.bn(feat_fused))
