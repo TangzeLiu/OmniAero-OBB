@@ -17,6 +17,32 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
+#################
+
+def laplacian_loss(pred_contour, target_img):
+    """
+    计算二阶拉普拉斯几何损失
+    pred_contour: [B, 1, H/2, W/2]
+    target_img: [B, 4, H, W]
+    """
+    # 1. 定义拉普拉斯算子
+    lap_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+                              device=target_img.device, dtype=target_img.dtype).view(1, 1, 3, 3)
+
+    # 2. 提取输入图的边缘 (对 RGB+T 取均值后卷积)
+    with torch.no_grad():
+        img_gray = target_img.mean(dim=1, keepdim=True)
+        edge_gt = F.conv2d(img_gray, lap_kernel, padding=1).abs()
+        # 尺寸下采样对齐 (匹配 pred_contour 的 H/2, W/2)
+        edge_gt = F.interpolate(edge_gt, size=pred_contour.shape[2:], mode='bilinear', align_corners=False)
+        # 归一化到 0~1
+        edge_gt = (edge_gt - edge_gt.min()) / (edge_gt.max() + 1e-6)
+
+    # 3. 计算 MSE 损失 (pred_contour 记得过 Sigmoid)
+    return F.mse_loss(torch.sigmoid(pred_contour), edge_gt)
+
+##################
+
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -360,6 +386,9 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
+        # [修改 1] 保存完整的模型引用，方便后续在计算 Loss 时取 Backbone 的特征
+        self.model = model
+
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
         nl, ne = targets.shape
@@ -382,8 +411,6 @@ class v8DetectionLoss:
         if self.use_dfl:
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
@@ -441,31 +468,69 @@ class v8DetectionLoss:
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+
+        # 注意: 这里返回的是包含 (fg_mask, ...), loss_sum, loss_detach 的元组
         return (
             (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
-            loss,
-            loss.detach(),
-        )  # loss(box, cls, dfl)
+            loss.sum(),  # [修改] 返回三个基础 loss 之和用于总 loss 统计
+            loss.detach(),  # 返回分解的三个基础 loss items [box, cls, dfl]
+        )
 
     def parse_output(
-        self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
+            self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
     ) -> torch.Tensor:
         """Parse model predictions to extract features."""
         return preds[1] if isinstance(preds, tuple) else preds
 
     def __call__(
-        self,
-        preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]],
-        batch: dict[str, torch.Tensor],
+            self,
+            preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]],
+            batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        # 交由 self.loss() 去具体执行检测 loss 和拉普拉斯 loss 融合
         return self.loss(self.parse_output(preds), batch)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate detection loss using assigned targets."""
+        """Calculate detection loss using assigned targets and geometry (Laplacian) loss."""
         batch_size = preds["boxes"].shape[0]
-        loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)[1:]
-        return loss * batch_size, loss_detach
+
+        # 1. 计算原有的检测 loss (box, cls, dfl)
+        # 现在的 get_assigned_targets_and_loss 返回元组: (中间变量, 基础loss和, 分解的loss_items)
+        _, loss_base_sum, loss_items = self.get_assigned_targets_and_loss(preds, batch)
+
+        # =======================================================
+        # 2. 插入拉普拉斯 Loss 逻辑
+        # =======================================================
+        l_geo = torch.tensor(0.0, device=self.device)
+
+        # 寻找 Backbone 中的第 0 层模块 (CBAMFusion 等包含 temp_contour 的模块)
+        cbam_module = getattr(self.model.model, '0', None)
+
+        if cbam_module and hasattr(cbam_module, 'temp_contour'):
+            feat_contour = cbam_module.temp_contour
+            if feat_contour is not None:
+                # 计算几何损失 (假设你已经导入或定义了 laplacian_loss)
+                # 传入原图或 batch['img']
+                l_geo = laplacian_loss(feat_contour, batch['img'])
+
+                # 清空缓存防止干扰下一 batch
+                cbam_module.temp_contour = None
+
+        # 假设 hyp_geo 系数为 0.1 (你也可以把它写在 self.hyp.geo 中进行传参)
+        hyp_geo = 0.1
+
+        # =======================================================
+        # 3. 汇总总 Loss 和 Loss Items
+        # =======================================================
+        total_loss = loss_base_sum + l_geo * hyp_geo
+
+        # YOLOv8 标准格式：返回 总loss * batch_size 和 detach好的各项 loss
+        # loss_items 原来长度是 3: [box_loss, cls_loss, dfl_loss]
+        # 把 l_geo 也拼装进去，使得终端打印 / Logging 能看到第 4 项指标 (Geo Loss)
+        final_loss_items = torch.cat((loss_items, (l_geo * hyp_geo).unsqueeze(0).detach()))
+
+        return total_loss * batch_size, final_loss_items
 
 
 class v8SegmentationLoss(v8DetectionLoss):
