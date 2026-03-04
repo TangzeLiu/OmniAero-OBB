@@ -77,7 +77,8 @@ from .conv import (
     RepConv,
     SpatialAttention,
     Fusion,
-    SCBFusion
+    SCBFusion,
+    CBAMFusion
 )
 from .head import (
     OBB,
@@ -194,4 +195,5 @@ __all__ = (
     "Fusion",
     "SCBFusion",
     "C2f_Transformer",
+    "CBAMFusion",
 )

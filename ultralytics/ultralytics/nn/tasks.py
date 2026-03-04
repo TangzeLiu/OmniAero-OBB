@@ -76,6 +76,7 @@ from ultralytics.nn.modules import (
     SCBFusion,
     C2f_Transformer,
     CBAM,
+    CBAMFusion
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1609,7 +1610,8 @@ def parse_model(d, ch, verbose=True):
             Fusion,
             SCBFusion,
             C2f_Transformer,
-            CBAM
+            CBAM,
+            CBAMFusion
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments

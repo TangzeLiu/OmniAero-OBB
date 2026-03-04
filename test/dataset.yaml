@@ -4,8 +4,9 @@
 
 # 1. 数据集根目录 (建议使用绝对路径，防止出错)
 # 注意：Windows下路径分隔符可以用 / 或者 \\，建议用 /
-path: /mnt/workspace/OmniAero-OBB/src/dataset
-
+path: F:\work\OmniAero-OBB\src\dataset
+# /mnt/workspace/OmniAero-OBB/src/dataset
+#
 # 2. 数据集分支路径 (相对于上面的 path)
 # 训练集：指向 RGB 图片文件夹
 train: train/images/train

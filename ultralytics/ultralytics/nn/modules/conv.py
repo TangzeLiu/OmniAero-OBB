@@ -26,6 +26,7 @@ __all__ = (
     "SpatialAttention",
     "Fusion",
     "SCBFusion",
+    "CBAMFusion"
 )
 
 
@@ -819,3 +820,72 @@ class SCBFusion(nn.Module):
 
         # E. 输出
         return self.act(self.bn(fused_feat))
+
+
+class CBAMFusion(nn.Module):
+    def __init__(self,c1, c2, k=3, s=2, p=None, g=1, d=1, act=True):
+        super().__init__()
+
+        # --- 第一阶段：原位审计 (4通道对撞) ---
+        # 专门针对原始 R,G,B (3ch) 和 T (1ch) 的互查
+        self.mlp_rgb = nn.Sequential(nn.Linear(3, 1), nn.ReLU(), nn.Linear(1, 1))
+        self.mlp_t = nn.Sequential(nn.Linear(1, 1), nn.ReLU(), nn.Linear(1, 1))
+
+        # --- 第二阶段：特征提取 ---
+        # 语义投影：将审计后的 4 通道映射到高维 c2
+        self.conv_semantic = nn.Conv2d(4, c2, kernel_size=1, stride=s, bias=False)
+        # 几何投影：3x3 提取轮廓
+        self.conv_contour = nn.Conv2d(4, 1, kernel_size=3, stride=s, padding=1, bias=False)
+
+        # --- 第三阶段：空间细化 ---
+        self.conv_spatial = nn.Conv2d(2, 1, 7, padding=3, bias=False)
+
+        self.tanh = nn.Tanh()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU() if act is True else nn.Identity()
+
+    def forward(self, x):
+
+
+        # x: [B, 4, H, W]
+        b, c_in, h, w = x.size()
+
+        if c_in == 3:
+            # 如果输入只有 3 通道，我们补一个全 0 的第 4 通道 (T)
+            x_rgb = x
+            x_t = torch.zeros((b, 1, h, w), device=x.device, dtype=x.dtype)
+        else:
+            # 正常训练/推理时的 4 通道逻辑
+            x_rgb = x[:, :3, :, :]
+            x_t = x[:, 3:4, :, :]
+
+
+        # --- Step 1: 原位互查 (控制核心) ---
+        # 提取原始 4 通道的全局统计量
+        raw_rgb_gap = self.avg_pool(x_rgb).view(b, 3)
+        raw_t_gap = self.avg_pool(x_t).view(b, 1)
+
+        # 产生 -1 到 1 的权重
+        w_t_to_rgb = self.tanh(self.mlp_t(raw_t_gap)).view(b, 1, 1, 1)
+        w_rgb_to_t = self.tanh(self.mlp_rgb(raw_rgb_gap)).view(b, 1, 1, 1)
+
+        # 修正原始 4 通道
+        x_refined = torch.cat([
+            x_rgb * (1 + w_t_to_rgb),
+            x_t * (1 + w_rgb_to_t)
+        ], dim=1)
+
+        # --- Step 2: 分支投影 ---
+        # 此时 conv_semantic 处理的是已经“洗干净”的颜色数据
+        feat_color = self.conv_semantic(x_refined)
+        # 此时 conv_contour 提取的是逻辑一致的轮廓
+        feat_contour = self.conv_contour(x_refined)
+
+        # --- Step 3: 空间锚定 ---
+        semantic_map, _ = torch.max(feat_color, dim=1, keepdim=True)
+        spatial_info = torch.cat([semantic_map, feat_contour], dim=1)
+        w_spatial = self.tanh(self.conv_spatial(spatial_info))
+
+        out = feat_color * (1 + w_spatial)
+        return self.act(self.bn(out))
